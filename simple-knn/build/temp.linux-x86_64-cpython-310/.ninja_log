@@ -1,0 +1,4 @@
+# ninja log v5
+1	18115	1733929181295987678	/dtu/blackhole/11/180913/dreamgaussian/simple-knn/build/temp.linux-x86_64-cpython-310/simple_knn.o	9e21587284fda927
+0	21599	1733929184778946769	/dtu/blackhole/11/180913/dreamgaussian/simple-knn/build/temp.linux-x86_64-cpython-310/ext.o	8ca5610e44347a5f
+1	67389	1733929230552409132	/dtu/blackhole/11/180913/dreamgaussian/simple-knn/build/temp.linux-x86_64-cpython-310/spatial.o	3659bc1e7be58dca
