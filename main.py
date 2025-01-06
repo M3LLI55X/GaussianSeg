@@ -55,6 +55,9 @@ class GUI:
         self.prompt = ""
         self.negative_prompt = ""
 
+        # segmentation
+        self.segment = None
+
         # training stuff
         self.training = False
         self.optimizer = None
@@ -100,13 +103,11 @@ class GUI:
     def prepare_train(self):
 
         self.step = 0
-
         # setup training
         self.renderer.gaussians.training_setup(self.opt)
         # do not do progressive sh-level
         self.renderer.gaussians.active_sh_degree = self.renderer.gaussians.max_sh_degree
         self.optimizer = self.renderer.gaussians.optimizer
-
         # default camera
         if self.opt.mvdream or self.opt.imagedream:
             # the second view is the front view for mvdream/imagedream.
@@ -151,7 +152,7 @@ class GUI:
                 self.guidance_zero123 = Zero123(self.device, model_key='ashawkey/stable-zero123-diffusers')
             else:
                 self.guidance_zero123 = Zero123(self.device, model_key='ashawkey/zero123-xl-diffusers')
-            print(f"[INFO] loaded zero123!")
+            print(f"[INFO] have loaded zero123!")
 
         # input image
         if self.input_img is not None:
@@ -161,17 +162,17 @@ class GUI:
             self.input_mask_torch = torch.from_numpy(self.input_mask).permute(2, 0, 1).unsqueeze(0).to(self.device)
             self.input_mask_torch = F.interpolate(self.input_mask_torch, (self.opt.ref_size, self.opt.ref_size), mode="bilinear", align_corners=False)
 
+        # breakpoint()
         # prepare embeddings
         with torch.no_grad():
-
+            if self.enable_zero123:
+                self.guidance_zero123.get_img_embeds(self.input_img_torch)
+            
             if self.enable_sd:
                 if self.opt.imagedream:
                     self.guidance_sd.get_image_text_embeds(self.input_img_torch, [self.prompt], [self.negative_prompt])
                 else:
                     self.guidance_sd.get_text_embeds([self.prompt], [self.negative_prompt])
-
-            if self.enable_zero123:
-                self.guidance_zero123.get_img_embeds(self.input_img_torch)
 
     def train_step(self):
         starter = torch.cuda.Event(enable_timing=True)
@@ -179,7 +180,6 @@ class GUI:
         starter.record()
 
         for _ in range(self.train_steps):
-
             self.step += 1
             step_ratio = min(1, self.step / self.opt.iters)
 
@@ -201,9 +201,16 @@ class GUI:
                 loss = loss + 1000 * (step_ratio if self.opt.warmup_rgb_loss else 1) * F.mse_loss(mask, self.input_mask_torch)
                 
                 # segmentation loss
-                # pred_segmentation = out["segmentation"].unsqueeze(0)  # [1, H, W]
-                # seg_loss = F.cross_entropy(pred_segmentation.view(-1, self.num_classes), self.segmentation_mask.view(-1))
-                # loss += self.opt.segmentation_loss_weight * seg_loss
+                # if hasattr(self, 'segment'):
+                pred_segmentation = out["segment"] # [H, W]
+                # 将预测转换为概率分布
+                pred_segmentation = F.one_hot(pred_segmentation.long(), num_classes=self.renderer.gaussians.num_classes).float()
+                pred_segmentation = pred_segmentation.permute(2, 0, 1).unsqueeze(0) # [1, num_classes, H, W]
+                
+                # 计算交叉熵损失
+                seg_loss = F.cross_entropy(pred_segmentation, self.segment[..., 0].long())
+                loss = loss + self.opt.seg_loss_weight * seg_loss
+
 
             ### novel view (manual batch)
             render_resolution = 128 if step_ratio < 0.3 else (256 if step_ratio < 0.6 else 512)
@@ -235,7 +242,6 @@ class GUI:
 
                 image = out["image"].unsqueeze(0) # [1, 3, H, W] in [0, 1]
                 images.append(image)
-
                 # enable mvdream training
                 if self.opt.mvdream or self.opt.imagedream:
                     for view_i in range(1, 4):
@@ -249,10 +255,9 @@ class GUI:
 
                         image = out_i["image"].unsqueeze(0) # [1, 3, H, W] in [0, 1]
                         images.append(image)
-                    
+
             images = torch.cat(images, dim=0)
             poses = torch.from_numpy(np.stack(poses, axis=0)).to(self.device)
-
             # guidance loss
             if self.enable_sd:
                 if self.opt.mvdream or self.opt.imagedream:
@@ -263,6 +268,26 @@ class GUI:
             if self.enable_zero123:
                 loss = loss + self.opt.lambda_zero123 * self.guidance_zero123.train_step(images, vers, hors, radii, step_ratio=step_ratio if self.opt.anneal_timestep else None, default_elevation=self.opt.elevation)
             
+            # segmentation loss
+            if hasattr(self, 'segment'):
+                pred_seg = out["segment"] # [H, W]
+                pred_seg = F.one_hot(pred_seg.long(), num_classes=self.renderer.gaussians.num_classes).float()
+                pred_seg = pred_seg.permute(2, 0, 1).unsqueeze(0) # [1, num_classes, H, W]
+                
+                # 计算分割一致性损失（可以使用多种方式）
+                # 1. 相邻视角的分割图应该平滑变化
+                if len(images) > 1:
+                    prev_out = self.renderer.render(prev_cam, bg_color=bg_color)
+                    prev_seg = prev_out["segment"]
+                    prev_seg = F.one_hot(prev_seg.long(), num_classes=self.renderer.gaussians.num_classes).float()
+                    prev_seg = prev_seg.permute(2, 0, 1).unsqueeze(0)
+                    
+                    # 计算相邻视角的分割一致性损失
+                    consistency_loss = F.mse_loss(pred_seg, prev_seg)
+                    loss = loss + self.opt.seg_consistency_weight * consistency_loss
+                
+                prev_cam = cur_cam
+
             # optimize step
             loss.backward()
             self.optimizer.step()
@@ -286,12 +311,6 @@ class GUI:
 
         self.need_update = True
 
-        if self.gui:
-            dpg.set_value("_log_train_time", f"{t:.4f}ms")
-            dpg.set_value(
-                "_log_train_log",
-                f"step = {self.step: 5d} (+{self.train_steps: 2d}) loss = {loss.item():.4f}",
-            )
 
 
     @torch.no_grad()

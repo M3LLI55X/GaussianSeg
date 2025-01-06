@@ -120,6 +120,7 @@ class BasicPointCloud(NamedTuple):
     points: np.array
     colors: np.array
     normals: np.array
+    labels: np.array = None
 
 
 class GaussianModel:
@@ -133,12 +134,9 @@ class GaussianModel:
         
         self.scaling_activation = torch.exp
         self.scaling_inverse_activation = torch.log
-
         self.covariance_activation = build_covariance_from_scaling_rotation
-
         self.opacity_activation = torch.sigmoid
         self.inverse_opacity_activation = inverse_sigmoid
-
         self.rotation_activation = torch.nn.functional.normalize
 
 
@@ -158,7 +156,8 @@ class GaussianModel:
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
-        self.labels=None
+        self._identity = torch.empty(0) # [N, C] 每个高斯的身份编码
+        self.num_classes = 0 # 类别总数
 
     def capture(self):
         return (
@@ -353,6 +352,15 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        
+        if hasattr(pcd, 'labels'):
+            self.num_classes = len(torch.unique(pcd.labels))
+            # 初始化分割概率 [N, num_classes]
+            seg_probs = torch.zeros((fused_point_cloud.shape[0], self.num_classes), device="cuda")
+            # 根据初始标签设置概率
+            seg_probs.scatter_(1, pcd.labels.unsqueeze(1), 1.0)
+            self._seg_probs = nn.Parameter(inverse_sigmoid(seg_probs).requires_grad_(True))
+
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -365,7 +373,8 @@ class GaussianModel:
             {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
-            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
+            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
+            {'params': [self._seg_probs], 'lr': training_args.feature_lr, "name": "seg_probs"}  # 添加分割概率的优化
         ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
@@ -408,6 +417,37 @@ class GaussianModel:
         rotation = self._rotation.detach().cpu().numpy()
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
+
+        # 获取标签
+        labels = self._identity.detach().cpu().numpy()
+        
+        # 定义标签颜色映射
+        label_colors = np.array([
+            [1.0, 0.0, 0.0],  # 红色 - 标签 0
+            [0.0, 1.0, 0.0],  # 绿色 - 标签 1
+            [0.0, 0.0, 1.0],  # 蓝色 - 标签 2
+            [1.0, 1.0, 0.0],  # 黄色 - 标签 3
+            [1.0, 0.0, 1.0],  # 紫色 - 标签 4
+            [0.0, 1.0, 1.0],  # 青色 - 标签 5
+        ])
+        
+        # 根据标签分配颜色
+        colors = label_colors[labels]
+        
+        # 保存原始特征
+        f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        opacities = self._opacity.detach().cpu().numpy()
+        scale = self._scaling.detach().cpu().numpy()
+        rotation = self._rotation.detach().cpu().numpy()
+
+        # 添加颜色属性到dtype
+        dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
+        dtype_full.extend([
+            ('red', 'f4'), ('green', 'f4'), ('blue', 'f4'),  # 添加RGB颜色
+            ('label', 'i4')  # 添加标签
+        ])
+
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
         attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
@@ -461,6 +501,10 @@ class GaussianModel:
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
 
         self.active_sh_degree = self.max_sh_degree
+
+        identity = np.asarray(plydata.elements[0]["identity"])
+        self._identity = nn.Parameter(torch.tensor(identity, dtype=torch.long, device="cuda").requires_grad_(False))
+        self.num_classes = len(torch.unique(self._identity))
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
@@ -552,6 +596,17 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
+        # 复制父节点的身份编码给新生成的点
+        # if len(new_xyz) > 0:
+        #     parent_indices = torch.arange(len(self._identity)).repeat_interleave(N) 
+        #     new_identity = self._identity[parent_indices]
+        #     self._identity = nn.Parameter(torch.cat([self._identity, new_identity], dim=0).requires_grad_(False))
+        if hasattr(self, '_identity'):
+            N = len(new_xyz) // len(self._identity)  # 每个原始点生成的新点数
+            parent_indices = torch.arange(len(self._identity)).repeat_interleave(N) 
+            new_identity = self._identity[parent_indices]
+            self._identity = nn.Parameter(torch.cat([self._identity, new_identity], dim=0).requires_grad_(False))
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -685,7 +740,13 @@ class Renderer:
             dtype=torch.float32,
             device="cuda",
         )
-    
+        unique_labels = torch.unique(self.gaussians._identity)
+        random_colors = torch.rand((unique_labels.size(0), 3), device='cuda')
+        self.label_colors = {
+            int(lbl.item()): random_colors[i]
+            for i, lbl in enumerate(unique_labels)
+        }
+     
     def initialize(self, input=None, num_pts=5000, radius=0.5):
         # load checkpoint
         if input is None:
@@ -700,11 +761,13 @@ class Renderer:
             y = radius * np.sin(thetas) * np.sin(phis)
             z = radius * np.cos(thetas)
             xyz = np.stack((x, y, z), axis=1)
-            # xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
 
             shs = np.random.random((num_pts, 3)) / 255.0
+
+            labels = np.zeros(num_pts, dtype=np.int64)
+
             pcd = BasicPointCloud(
-                points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3))
+                points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)), labels=torch.from_numpy(labels).cuda()
             )
             self.gaussians.create_from_pcd(pcd, 10)
         elif isinstance(input, BasicPointCloud):
@@ -796,8 +859,9 @@ class Renderer:
         else:
             colors_precomp = override_color
 
+        seg_probs = torch.sigmoid(self.gaussians._seg_probs)  # [N, num_classes]
         # Rasterize visible Gaussians to image, obtain their radii (on screen).
-        rendered_image, radii, rendered_depth, rendered_alpha = rasterizer(
+        rendered_image, radii, rendered_depth, rendered_alpha, contributions = rasterizer(
             means3D=means3D,
             means2D=means2D,
             shs=shs,
@@ -806,28 +870,40 @@ class Renderer:
             scales=scales,
             rotations=rotations,
             cov3D_precomp=cov3D_precomp,
+            identities=self.gaussians._identity, 
+            seg_probs=seg_probs,
         )
 
+         # 使用批处理计算分割图
+        max_contrib_indices = contributions.argmax(dim=0)  # [H, W]
+        segmentation = self.gaussians._identity[max_contrib_indices]  # [H, W]
+
         rendered_image = rendered_image.clamp(0, 1)
-
-        # segment the image
-        # segmentation = torch.zeros((viewpoint_camera.image_height, viewpoint_camera.image_width), dtype=torch.long, device="cuda")
-        # for i in range(viewpoint_camera.image_height):
-        #     for j in range(viewpoint_camera.image_width):
-        #         pixel_contributions = contributions[:, i, j]  # [N]
-        #         labels = self.gaussians.labels  # [N]
-        #         max_idx = pixel_contributions.argmax()
-        #         segmentation[i, j] = labels[max_idx]
-        # for i in range(viewpoint_camera.image_height):
-        #     for j in range(viewpoint_camera.image_width):
-        #         # 获取高斯对像素 (i, j) 的贡献
-        #         pixel_contributions = contributions[:, i, j]  # [N]
-        #         # 获取高斯的标签
-        #         labels = self.gaussians.labels  # [N]
-        #         # 确定贡献最大的标签
-        #         max_idx = pixel_contributions.argmax()
-        #         segmentation[i, j] = labels[max_idx]
-
+        segmentation = torch.zeros((viewpoint_camera.image_height, viewpoint_camera.image_width), dtype=torch.long, device="cuda")
+        
+        for i in range(viewpoint_camera.image_height):
+            for j in range(viewpoint_camera.image_width):
+                # 获取高斯对像素(i,j)的贡献
+                pixel_contributions = contributions[:, i, j] # [N] 
+                # 获取高斯的标签
+                labels = self.gaussians._identity # [N]
+                # 确定贡献最大的标签
+                max_idx = pixel_contributions.argmax()
+                segmentation[i, j] = labels[max_idx]
+        # 如果是渲染标签模式
+        render_label = True
+        if render_label:
+            labels = self.gaussians._identity
+            colors_precomp = self.label_colors[labels]
+        else:
+            if colors_precomp is None:
+                if convert_SHs_python:
+                    # ... 现有代码 ...
+                    pass
+                else:
+                    shs = self.gaussians.get_features
+            else:
+                colors_precomp = override_color
         
         # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
         # They will be excluded from value updates used in the splitting criteria.
@@ -838,5 +914,5 @@ class Renderer:
             "viewspace_points": screenspace_points,
             "visibility_filter": radii > 0,
             "radii": radii,
-            # "regment":segment,
+            "segment":segmentation,
         }
