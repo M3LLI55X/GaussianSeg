@@ -241,6 +241,16 @@ class GUI:
 
                 image = out["image"].unsqueeze(0) # [1, 3, H, W] in [0, 1]
                 images.append(image)
+                # # save images for visualization
+                os.makedirs('logs/imgs', exist_ok=True)
+                # ...existing code...
+                img_np = image[0].detach().cpu().permute(1, 2, 0).numpy()
+                img_np = (img_np * 255).astype(np.uint8)
+                cv2.imwrite(f'logs/imgs/step_{self.step}.png', img_np[..., ::-1])
+
+                with open("poses.txt", "a") as f:
+                    f.write(f"logs/{pose.tolist()}\n")
+
 
                 # enable mvdream training
                 if self.opt.mvdream or self.opt.imagedream:
@@ -258,7 +268,7 @@ class GUI:
                     
             images = torch.cat(images, dim=0)
             poses = torch.from_numpy(np.stack(poses, axis=0)).to(self.device)
-
+            
             # guidance loss
             if self.enable_sd:
                 if self.opt.mvdream or self.opt.imagedream:
@@ -285,6 +295,7 @@ class GUI:
                 
                 if self.step % self.opt.opacity_reset_interval == 0:
                     self.renderer.gaussians.reset_opacity()
+
 
         ender.record()
         torch.cuda.synchronize()
@@ -377,42 +388,45 @@ class GUI:
             )  # buffer must be contiguous, else seg fault!
    
     def load_input(self, file):
-        # load image
         print(f'[INFO] load image from {file}...')
         img = cv2.imread(file, cv2.IMREAD_UNCHANGED)
+        # 如果只含3通道，使用rembg进行背景去除
         if img.shape[-1] == 3:
             if self.bg_remover is None:
                 self.bg_remover = rembg.new_session()
             img = rembg.remove(img, session=self.bg_remover)
 
+        # 调整图像大小，归一化
         img = cv2.resize(img, (self.W, self.H), interpolation=cv2.INTER_AREA)
         img = img.astype(np.float32) / 255.0
 
-        self.input_mask = img[..., 3:]
-        # white bg
-        self.input_img = img[..., :3] * self.input_mask + (1 - self.input_mask)
-        # bgr to rgb
-        self.input_img = self.input_img[..., ::-1].copy()
+        # 用图像第4通道(若有)做前景合成
+        input_mask = img[..., 3:] if img.shape[-1] == 4 else np.ones((self.H, self.W, 1), dtype=np.float32)
+        self.input_img = img[..., :3] * input_mask + (1 - input_mask)
+        self.input_img = self.input_img[..., ::-1].copy()  # BGR->RGB
 
-        # load prompt
+        # 读取并调整分割图，0为背景，1、2为不同材质
+        seg = cv2.imread(self.opt.seg, cv2.IMREAD_GRAYSCALE)
+        seg = cv2.resize(seg, (self.W, self.H), interpolation=cv2.INTER_NEAREST)
+        unique_labels = np.unique(seg)
+        print(f"Found {len(unique_labels)} distinct classes in segmentation: {unique_labels}")
+
+        # 只保留材质1的区域为真
+        mask_class_1 = (seg == 1).astype(np.float32)[..., None]
+
+        # 将材质1之外的部分替换为白色
+        white_bg = np.ones_like(self.input_img, dtype=np.float32)
+        self.input_img = self.input_img * mask_class_1 + white_bg * (1 - mask_class_1)
+
+        # 留下材质1的mask供后续训练使用
+        self.input_mask = mask_class_1
+
+        # 若存在同名的文本提示文件，则读取
         file_prompt = file.replace("_rgba.png", "_caption.txt")
         if os.path.exists(file_prompt):
             print(f'[INFO] load prompt from {file_prompt}...')
             with open(file_prompt, "r") as f:
                 self.prompt = f.read().strip()
-
-                # segmentation
-        seg_maskdir = self.opt.seg
-        seg = cv2.imread(seg_maskdir)
-        seg = cv2.resize(seg, (256, 256), interpolation=cv2.INTER_NEAREST)
-        self.segment = torch.from_numpy(seg).to(self.device).unsqueeze(0).float() / 255.0
-        print(f'[INFO] loaded segmentation from {seg_maskdir}...')
-
-        #load segmentation
-        # seg = cv2.imread(self.opt.seg, cv2.IMREAD_UNCHANGED)
-        # seg_mask = (seg == 1).astype(np.float32)
-        # self.input_img *= seg_mask[..., None]
-        # self.input_mask *= seg_mask[..., None]
 
     @torch.no_grad()
     def save_model(self, mode='geo', texture_size=1024):
