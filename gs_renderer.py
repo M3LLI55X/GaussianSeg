@@ -9,7 +9,7 @@ from torch import nn
 
 from diff_gaussian_rasterization import (
     GaussianRasterizationSettings,
-    GaussianRasterizer,
+    GaussianRasterizer, 
 )
 from simple_knn._C import distCUDA2
 

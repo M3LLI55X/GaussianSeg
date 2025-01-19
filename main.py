@@ -205,11 +205,6 @@ class GUI:
                 # mask loss
                 mask = out["alpha"].unsqueeze(0) # [1, 1, H, W] in [0, 1]
                 loss = loss + 1000 * (step_ratio if self.opt.warmup_rgb_loss else 1) * F.mse_loss(mask, self.input_mask_torch)
-                
-                # segmentation loss
-                # pred_segmentation = out["segmentation"].unsqueeze(0)  # [1, H, W]
-                # seg_loss = F.cross_entropy(pred_segmentation.view(-1, self.num_classes), self.segmentation_mask.view(-1))
-                # loss += self.opt.segmentation_loss_weight * seg_loss
 
             ### novel view (manual batch)
             render_resolution = 128 if step_ratio < 0.3 else (256 if step_ratio < 0.6 else 512)
@@ -241,9 +236,9 @@ class GUI:
 
                 image = out["image"].unsqueeze(0) # [1, 3, H, W] in [0, 1]
                 images.append(image)
+
                 # # save images for visualization
                 os.makedirs('logs/imgs', exist_ok=True)
-                # ...existing code...
                 img_np = image[0].detach().cpu().permute(1, 2, 0).numpy()
                 img_np = (img_np * 255).astype(np.uint8)
                 cv2.imwrite(f'logs/imgs/step_{self.step}.png', img_np[..., ::-1])
@@ -296,7 +291,6 @@ class GUI:
                 if self.step % self.opt.opacity_reset_interval == 0:
                     self.renderer.gaussians.reset_opacity()
 
-
         ender.record()
         torch.cuda.synchronize()
         t = starter.elapsed_time(ender)
@@ -316,7 +310,6 @@ class GUI:
         # train_steps = min(16, max(4, int(16 * 500 / full_t)))
         # if train_steps > self.train_steps * 1.2 or train_steps < self.train_steps * 0.8:
         #     self.train_steps = train_steps
-
 
     @torch.no_grad()
     def test_step(self):
@@ -390,7 +383,6 @@ class GUI:
     def load_input(self, file):
         print(f'[INFO] load image from {file}...')
         img = cv2.imread(file, cv2.IMREAD_UNCHANGED)
-        # 如果只含3通道，使用rembg进行背景去除
         if img.shape[-1] == 3:
             if self.bg_remover is None:
                 self.bg_remover = rembg.new_session()
@@ -399,27 +391,29 @@ class GUI:
         # 调整图像大小，归一化
         img = cv2.resize(img, (self.W, self.H), interpolation=cv2.INTER_AREA)
         img = img.astype(np.float32) / 255.0
-
-        # 用图像第4通道(若有)做前景合成
         input_mask = img[..., 3:] if img.shape[-1] == 4 else np.ones((self.H, self.W, 1), dtype=np.float32)
         self.input_img = img[..., :3] * input_mask + (1 - input_mask)
         self.input_img = self.input_img[..., ::-1].copy()  # BGR->RGB
-
+        
         # 读取并调整分割图，0为背景，1、2为不同材质
         seg = cv2.imread(self.opt.seg, cv2.IMREAD_GRAYSCALE)
+        if seg is None or seg.size == 0:
+            print(f'[ERROR] segmentation file {self.opt.seg} not found or empty!')
+            return
         seg = cv2.resize(seg, (self.W, self.H), interpolation=cv2.INTER_NEAREST)
         unique_labels = np.unique(seg)
         print(f"Found {len(unique_labels)} distinct classes in segmentation: {unique_labels}")
 
         # 只保留材质1的区域为真
         mask_class_1 = (seg == 1).astype(np.float32)[..., None]
+        mask_class_2 = (seg == 2).astype(np.float32)[..., None]
 
         # 将材质1之外的部分替换为白色
         white_bg = np.ones_like(self.input_img, dtype=np.float32)
-        self.input_img = self.input_img * mask_class_1 + white_bg * (1 - mask_class_1)
+        self.input_img = self.input_img * mask_class_2 + white_bg * (1 - mask_class_2)
 
         # 留下材质1的mask供后续训练使用
-        self.input_mask = mask_class_1
+        self.input_mask = mask_class_2
 
         # 若存在同名的文本提示文件，则读取
         file_prompt = file.replace("_rgba.png", "_caption.txt")
@@ -569,16 +563,6 @@ class GUI:
             self.renderer.gaussians.save_ply(path)
 
         print(f"[INFO] save model to {path}.")
-
-
-    def render(self):
-        assert self.gui
-        while dpg.is_dearpygui_running():
-            # update texture every frame
-            if self.training:
-                self.train_step()
-            self.test_step()
-            dpg.render_dearpygui_frame()
     
     # no gui mode
     def train(self, iters=500):
@@ -588,6 +572,49 @@ class GUI:
                 self.train_step()
             # do a last prune
             self.renderer.gaussians.prune(min_opacity=0.01, extent=1, max_screen_size=1)
+            final_pruned = self.renderer.gaussians
+            # render from default camera view
+            # set front view for final render
+            pose = orbit_camera(self.opt.elevation, 0, self.opt.radius)
+            # render final pruned gaussians from front view
+            cur_cam = MiniCam(pose, self.opt.ref_size, self.opt.ref_size, self.cam.fovy, self.cam.fovx, self.cam.near, self.cam.far)
+            final_renderer = Renderer(sh_degree=self.opt.sh_degree)
+            final_renderer.gaussians = final_pruned
+            out = final_renderer.render(cur_cam)
+            render_image = out["image"].detach().cpu().numpy()
+            print("render_image shape:", render_image.shape)
+
+            # 如果是 (C,H,W)，转成 (H,W,C)
+            if render_image.ndim == 3 and render_image.shape[0] in [1,3,4]:
+                render_image = np.transpose(render_image, (1, 2, 0))
+
+            # 只留 RGB 三通道
+            if render_image.shape[2] > 3:
+                render_image = render_image[..., :3]
+
+            render_image = (render_image * 255).astype(np.uint8)
+            cv2.imwrite('/work3/s222477/GaussianSeg/logs/render_results/final_render.png', render_image)
+            breakpoint()
+            # initialize SAM
+            sam = sam_model_registry["default"](checkpoint="sam_vit_h_4b8939.pth")
+            mask_generator = SamAutomaticMaskGenerator(sam)
+
+            # generate masks
+            masks = mask_generator.generate(render_image)
+
+            # back-project masks to 3D
+            for mask in masks:
+                mask_binary = mask["segmentation"]
+                # get 3D points that project into masked region
+                visible_points = final_pruned.get_xyz[out["visibility_filter"]]
+                projected_points = visible_points @ cur_cam.view_proj.T
+                in_mask = mask_binary[projected_points[...,0:2].long()]
+                
+                # assign labels to gaussians
+                final_pruned.labels[out["visibility_filter"]][in_mask] = mask["label"]
+
+        breakpoint()
+
         # save
         self.save_model(mode='model')
         self.save_model(mode='geo+tex')
@@ -596,6 +623,7 @@ class GUI:
 if __name__ == "__main__":
     import argparse
     from omegaconf import OmegaConf
+    # from segment_anything import sam_model_registry, SamAutomaticMaskGenerator #改
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, help="path to the yaml config file")
@@ -608,6 +636,7 @@ if __name__ == "__main__":
     gui = GUI(opt)
 
     if opt.gui:
-        gui.render()
+        # gui.render()
+        pass
     else:
         gui.train(opt.iters)
