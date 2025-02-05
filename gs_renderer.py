@@ -195,6 +195,10 @@ class GaussianModel:
         self.optimizer.load_state_dict(opt_dict)
 
     @property
+    def num_gaussians(self):
+        return self._xyz.size(0)
+
+    @property
     def get_scaling(self):
         return self.scaling_activation(self._scaling)
     

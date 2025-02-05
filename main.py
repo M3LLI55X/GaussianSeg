@@ -16,6 +16,12 @@ from gs_renderer import Renderer, MiniCam
 from grid_put import mipmap_linear_grid_put_2d
 from mesh import Mesh, safe_normalize
 
+import os
+from segment_anything import sam_model_registry, SamAutomaticMaskGenerator, SamPredictor
+from segmentation import load_mask_image, load_json_result, create_material_mapping, \
+                        generate_material_array, load_and_resize_masks, load_all_mask_images, \
+                        create_large_matrix, merge_masks_into_large_matrix, create_color_mapping, \
+                        generate_color_image, save_color_image, refine_masks, process_mask_list
 class GUI:
     def __init__(self, opt):
         self.opt = opt  # shared with the trainer's opt to support in-place modification of rendering parameters.
@@ -238,14 +244,13 @@ class GUI:
                 images.append(image)
 
                 # # save images for visualization
-                os.makedirs('logs/imgs', exist_ok=True)
+                # os.makedirs('logs/imgs', exist_ok=True)
                 img_np = image[0].detach().cpu().permute(1, 2, 0).numpy()
                 img_np = (img_np * 255).astype(np.uint8)
-                cv2.imwrite(f'logs/imgs/step_{self.step}.png', img_np[..., ::-1])
+                # cv2.imwrite(f'logs/imgs/step_{self.step}.png', img_np[..., ::-1])
 
                 with open("poses.txt", "a") as f:
                     f.write(f"logs/{pose.tolist()}\n")
-
 
                 # enable mvdream training
                 if self.opt.mvdream or self.opt.imagedream:
@@ -303,13 +308,6 @@ class GUI:
                 "_log_train_log",
                 f"step = {self.step: 5d} (+{self.train_steps: 2d}) loss = {loss.item():.4f}",
             )
-
-        # dynamic train steps (no need for now)
-        # max allowed train time per-frame is 500 ms
-        # full_t = t / self.train_steps * 16
-        # train_steps = min(16, max(4, int(16 * 500 / full_t)))
-        # if train_steps > self.train_steps * 1.2 or train_steps < self.train_steps * 0.8:
-        #     self.train_steps = train_steps
 
     @torch.no_grad()
     def test_step(self):
@@ -388,33 +386,13 @@ class GUI:
                 self.bg_remover = rembg.new_session()
             img = rembg.remove(img, session=self.bg_remover)
 
-        # 调整图像大小，归一化
+        # # 调整图像大小，归一化
         img = cv2.resize(img, (self.W, self.H), interpolation=cv2.INTER_AREA)
         img = img.astype(np.float32) / 255.0
-        input_mask = img[..., 3:] if img.shape[-1] == 4 else np.ones((self.H, self.W, 1), dtype=np.float32)
-        self.input_img = img[..., :3] * input_mask + (1 - input_mask)
+        self.input_mask = img[..., 3:] if img.shape[-1] == 4 else np.ones((self.H, self.W, 1), dtype=np.float32)
+        self.input_img = img[..., :3] * self.input_mask + (1 - self.input_mask)
         self.input_img = self.input_img[..., ::-1].copy()  # BGR->RGB
         
-        # 读取并调整分割图，0为背景，1、2为不同材质
-        seg = cv2.imread(self.opt.seg, cv2.IMREAD_GRAYSCALE)
-        if seg is None or seg.size == 0:
-            print(f'[ERROR] segmentation file {self.opt.seg} not found or empty!')
-            return
-        seg = cv2.resize(seg, (self.W, self.H), interpolation=cv2.INTER_NEAREST)
-        unique_labels = np.unique(seg)
-        print(f"Found {len(unique_labels)} distinct classes in segmentation: {unique_labels}")
-
-        # 只保留材质1的区域为真
-        mask_class_1 = (seg == 1).astype(np.float32)[..., None]
-        mask_class_2 = (seg == 2).astype(np.float32)[..., None]
-
-        # 将材质1之外的部分替换为白色
-        white_bg = np.ones_like(self.input_img, dtype=np.float32)
-        self.input_img = self.input_img * mask_class_2 + white_bg * (1 - mask_class_2)
-
-        # 留下材质1的mask供后续训练使用
-        self.input_mask = mask_class_2
-
         # 若存在同名的文本提示文件，则读取
         file_prompt = file.replace("_rgba.png", "_caption.txt")
         if os.path.exists(file_prompt):
@@ -572,49 +550,204 @@ class GUI:
                 self.train_step()
             # do a last prune
             self.renderer.gaussians.prune(min_opacity=0.01, extent=1, max_screen_size=1)
+            
+            #current gaussians
             final_pruned = self.renderer.gaussians
-            # render from default camera view
-            # set front view for final render
-            pose = orbit_camera(self.opt.elevation, 0, self.opt.radius)
-            # render final pruned gaussians from front view
-            cur_cam = MiniCam(pose, self.opt.ref_size, self.opt.ref_size, self.cam.fovy, self.cam.fovx, self.cam.near, self.cam.far)
-            final_renderer = Renderer(sh_degree=self.opt.sh_degree)
-            final_renderer.gaussians = final_pruned
-            out = final_renderer.render(cur_cam)
-            render_image = out["image"].detach().cpu().numpy()
-            print("render_image shape:", render_image.shape)
+            # Increase render resolution for higher quality
+            high_res = 512 # Increased from default ref_size
+            
+            # render from multiple views with higher resolution
+            views = [
+                # front & back
+                (0, 0),
+                (0, 180),
+                # left & right 
+                (0, 90),
+                (0, -90),
+                # top & bottom views at 45 degrees
+                (45, 0),
+                (45, 90),
+                (45, 180),
+                (45, -90),
+                (-45, 0),
+                (-45, 90),
+                (-45, 180),
+                (-45, -90),
+            ]
 
-            # 如果是 (C,H,W)，转成 (H,W,C)
-            if render_image.ndim == 3 and render_image.shape[0] in [1,3,4]:
-                render_image = np.transpose(render_image, (1, 2, 0))
+            all_renders = []
+            os.makedirs(f'/work3/s222477/GaussianSeg/logs/render_results', exist_ok=True)
+            for elevation, azimuth in views:
+                pose = orbit_camera(elevation, azimuth, self.opt.radius)
+                cur_cam = MiniCam(pose, high_res, high_res, self.cam.fovy, self.cam.fovx, self.cam.near, self.cam.far)
+                out = self.renderer.render(cur_cam)
+                render = out["image"].detach().cpu().numpy()
+                
+                if render.ndim == 3 and render.shape[0] in [1,3,4]:
+                    render = np.transpose(render, (1, 2, 0))
+                if render.shape[2] > 3:
+                    render = render[..., :3]
+                    
+                render = (render * 255).astype(np.uint8)
+                all_renders.append(render)
+                save_path = f'/work3/s222477/GaussianSeg/logs/render_results/render_{elevation}_{azimuth}.png'
+                cv2.imwrite(save_path, render)
+                print(f"Saved render img at {save_path}")
 
-            # 只留 RGB 三通道
-            if render_image.shape[2] > 3:
-                render_image = render_image[..., :3]
+            os.makedirs(f'/work3/s222477/GaussianSeg/logs/seg_results', exist_ok=True)
+            result_path = f'/work3/s222477/GaussianSeg/logs/seg_results'
 
-            render_image = (render_image * 255).astype(np.uint8)
-            cv2.imwrite('/work3/s222477/GaussianSeg/logs/render_results/final_render.png', render_image)
-            breakpoint()
-            # initialize SAM
-            sam = sam_model_registry["default"](checkpoint="sam_vit_h_4b8939.pth")
-            mask_generator = SamAutomaticMaskGenerator(sam)
+            HOME = os.getcwd()
+            CHECKPOINT_PATH = os.path.join(HOME, "weights", "sam_vit_h_4b8939.pth")
+            DEVICE = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+            MODEL_TYPE = "vit_h"
 
-            # generate masks
-            masks = mask_generator.generate(render_image)
+            from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
+
+            print("[INFO] Loading SAM model...")
+            sam = sam_model_registry[MODEL_TYPE](checkpoint=CHECKPOINT_PATH).to(device=DEVICE)
+            mask_generator = SamAutomaticMaskGenerator(
+                sam,
+                points_per_side=32,
+                pred_iou_thresh=0.95,
+                stability_score_thresh=0.95,
+                crop_n_layers=1,
+                crop_n_points_downscale_factor=2,
+                min_mask_region_area=400,
+                output_mode="binary_mask",  # 只输出二值mask
+            )
+            
+            sam_result = []
+            print("[INFO] Generating masks for each view...")
+            for i, render in enumerate(all_renders):
+                print(f"Processing view {i+1}/{len(all_renders)}: elevation={views[i][0]}, azimuth={views[i][1]}")
+                try:
+                    # 检查渲染结果
+                    if render is None or render.size == 0:
+                        print(f"Invalid render for view {i}")
+                        sam_result.append([])
+                        continue
+                        
+                    # 打印渲染图像信息以便调试
+                    print(f"Render shape: {render.shape}, dtype: {render.dtype}, value range: [{render.min()}, {render.max()}]")
+                    
+                    masks = mask_generator.generate(render)
+                    if len(masks) == 0:
+                        print(f"Warning: No masks generated for view {i}")
+                    print(f"Generated {len(masks)} masks")
+                    sam_result.append(masks)
+                except Exception as e:
+                    print(f"Error processing view {i}: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    sam_result.append([])
+
+            # save each mask for each render
+            for i, sam_masks in enumerate(sam_result):
+                elevation, azimuth = views[i]
+                view_dir = os.path.join(result_path, f'view_{elevation}_{azimuth}')
+                os.makedirs(view_dir, exist_ok=True)
+                    
+                for j, mask in enumerate(sam_masks):
+                    if mask['segmentation'] is None or not mask['segmentation'].any():
+                        print(f"Skip invalid mask {j} for view_{elevation}_{azimuth}")
+                        continue
+                    mask_img = mask['segmentation'].astype(np.uint8) * 255
+                    save_path = os.path.join(view_dir, f'mask_{j}.png')
+                    cv2.imwrite(save_path, mask_img)
+
+            # Process each view directory to get clean masks
+            for elevation, azimuth in views:  # 解包元组
+                view_str = f'view_{elevation}_{azimuth}'  # 构造路径字符串
+                mask_dir = os.path.join(result_path, view_str)  # 使用字符串构造路径
+                if os.path.exists(mask_dir):
+                    print(f"Refining masks in {view_str}...")
+                    ori_view = f'{elevation}_{azimuth}' 
+                    refine_masks(mask_dir, ori_view)
+                else:
+                    print(f"Warning: Mask directory {mask_dir} not found for view {view_str}.")
 
             # back-project masks to 3D
-            for mask in masks:
-                mask_binary = mask["segmentation"]
-                # get 3D points that project into masked region
-                visible_points = final_pruned.get_xyz[out["visibility_filter"]]
-                projected_points = visible_points @ cur_cam.view_proj.T
-                in_mask = mask_binary[projected_points[...,0:2].long()]
-                
-                # assign labels to gaussians
-                final_pruned.labels[out["visibility_filter"]][in_mask] = mask["label"]
+            view_list = [
+                (0, 0), (0, 180),
+                (0, 90), (0, -90),
+                (45, 0), (45, 90), (45, 180), (45, -90),
+                (-45, 0), (-45, 90), (-45, 180), (-45, -90),
+            ]
+            clean_dir = "/work3/s222477/GaussianSeg/logs/clean"
 
+            # 一个用于将2D mask信息反向投影到3D高斯点云的过程。通过渲染不同视角下的3D模型，生成对应的2D图像，然后使用SAM（Segment Anything Model）生成mask，并将这些mask反向投影到3D点云中，为每个3D点赋予标签。
+            if final_pruned.labels is None or final_pruned.labels.shape[0] < final_pruned.num_gaussians:
+                final_pruned.labels = torch.zeros(final_pruned.num_gaussians, dtype=torch.long, device=self.device)
+
+            for elev, azim in view_list:
+                masks_path = os.path.join(clean_dir, f"{elev}_{azim}")
+                if not os.path.exists(masks_path):
+                    continue
+                pose = orbit_camera(elev, azim, self.opt.radius)
+                cam = MiniCam(pose, self.opt.ref_size, self.opt.ref_size, self.cam.fovy, self.cam.fovx, self.cam.near, self.cam.far)
+
+                for fname in os.listdir(masks_path):
+                    if not fname.endswith(".png"):
+                        print(f"Warning: Mask directory {masks_path} not found. Skipping.")
+                        continue
+
+                    mask_id = int(os.path.splitext(fname)[0].split('_')[0])
+                    label_id = hash(f"{elev}_{azim}_{mask_id}") % (2**16)
+
+                    mask_img = cv2.imread(os.path.join(masks_path, fname), cv2.IMREAD_GRAYSCALE)
+                    mask_tensor = torch.from_numpy(mask_img).to(self.device) > 127
+                    
+                    breakpoint()
+
+                    proj_out = self.renderer.render(cam)
+                    visible = proj_out["visibility_filter"]
+                    proj_xyz = proj_out["viewspace_points"]#得到当前视角下可见的点
+
+                    with torch.no_grad():
+                        # 显示当前投影角度
+                        print(f"Back-projecting labels from azim={azim}, elev={elev}")
+                        coords = (proj_xyz[..., :2] / (proj_xyz[..., 2:3] + 1e-5)) * (self.opt.ref_size / 2)
+                        coords = coords + (self.opt.ref_size / 2)
+                        coords = coords.long().clamp(min=0, max=self.opt.ref_size - 1)
+
+                        in_mask = coords[..., 1] * self.opt.ref_size + coords[..., 0]
+                        final_pruned.labels[visible] = torch.where(
+                            mask_tensor.view(-1)[in_mask],
+                            label_id,
+                            final_pruned.labels[visible]
+                        )
+            breakpoint()
+            
+
+            with torch.no_grad():
+                c_view = MiniCam(
+                    self.cam.pose,
+                    self.opt.ref_size,
+                    self.opt.ref_size,
+                    self.cam.fovy,
+                    self.cam.fovx,
+                    self.cam.near,
+                    self.cam.far,
+                )
+                res = self.renderer.render(c_view)
+                visible = res["visibility_filter"]
+                coords = (res["viewspace_points"][..., :2] / (res["viewspace_points"][..., 2:3].abs() + 1e-5)) * (self.opt.ref_size / 2)
+                coords = coords.long().clamp(0, self.opt.ref_size - 1)
+
+                max_label = final_pruned.labels.max().item()
+                color_map = torch.randint(0, 256, (max_label + 1, 3), device=self.device, dtype=torch.uint8)
+                color_canvas = torch.zeros((self.opt.ref_size, self.opt.ref_size, 3), dtype=torch.uint8, device=self.device)
+
+                inds = torch.where(visible)[0]
+                for i in inds:
+                    px, py = coords[i]
+                    lbl = final_pruned.labels[i].item()
+                    color_canvas[py, px] = color_map[lbl]
+
+                colored_mask = color_canvas.cpu().numpy()
+                cv2.imwrite("/work3/s222477/GaussianSeg/logs/colored_mask.png", colored_mask[..., ::-1])
         breakpoint()
-
         # save
         self.save_model(mode='model')
         self.save_model(mode='geo+tex')
@@ -623,8 +756,6 @@ class GUI:
 if __name__ == "__main__":
     import argparse
     from omegaconf import OmegaConf
-    # from segment_anything import sam_model_registry, SamAutomaticMaskGenerator #改
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, help="path to the yaml config file")
     parser.add_argument("--seg", required=True, help="path to the segmentation file")
