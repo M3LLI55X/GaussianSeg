@@ -842,5 +842,4 @@ class Renderer:
             "viewspace_points": screenspace_points,
             "visibility_filter": radii > 0,
             "radii": radii,
-            # "segment":segment,
         }

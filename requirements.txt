@@ -1,3 +1,6 @@
+torchvision
+pycocotools
+openai
 tqdm
 rich
 ninja
@@ -17,7 +20,7 @@ plyfile
 pygltflib
 
 # for gui
-dearpygui
+# dearpygui
 
 # for stable-diffusion
 huggingface_hub
@@ -33,5 +36,3 @@ pymeshlab
 
 rembg[gpu,cli]
 
-# gradio demo
-gradio

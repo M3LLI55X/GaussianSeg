@@ -247,10 +247,11 @@ class GUI:
                 # os.makedirs('logs/imgs', exist_ok=True)
                 img_np = image[0].detach().cpu().permute(1, 2, 0).numpy()
                 img_np = (img_np * 255).astype(np.uint8)
-                # cv2.imwrite(f'logs/imgs/step_{self.step}.png', img_np[..., ::-1])
+                # if self.step == self.opt.iters:
+                    # cv2.imwrite(f'logs/imgs/step_{self.step}.png', img_np[..., ::-1])
 
-                with open("poses.txt", "a") as f:
-                    f.write(f"logs/{pose.tolist()}\n")
+                # with open("poses.txt", "a") as f:
+                    # f.write(f"{pose.tolist()}\n")
 
                 # enable mvdream training
                 if self.opt.mvdream or self.opt.imagedream:
@@ -555,7 +556,34 @@ class GUI:
             final_pruned = self.renderer.gaussians
             # Increase render resolution for higher quality
             high_res = 512 # Increased from default ref_size
-            
+            # 渲染100张final_pruned的连贯视角图片保存在logs/100中
+            # render_dir = 'logs/100'
+            # os.makedirs(render_dir, exist_ok=True)
+            # num_views = 100
+            # for i in range(num_views):
+            #     # 生成均匀变化的视角，这里以水平旋转360度为例，保持海拔角不变
+            #     azimuth = (360 / num_views) * i
+            #     elevation = self.opt.elevation  # 可根据需求调整
+            #     pose = orbit_camera(elevation, azimuth, self.opt.radius)
+            #     cur_cam = MiniCam(
+            #         pose,
+            #         high_res,
+            #         high_res,
+            #         self.cam.fovy,
+            #         self.cam.fovx,
+            #         self.cam.near,
+            #         self.cam.far,
+            #     )
+            #     out = self.renderer.render(cur_cam)
+            #     render = out["image"].detach().cpu().numpy()
+            #     if render.ndim == 3 and render.shape[0] in [1, 3, 4]:
+            #         render = np.transpose(render, (1, 2, 0))
+            #     if render.shape[2] > 3:
+            #         render = render[..., :3]
+            #     render = (np.clip(render, 0, 1) * 255).astype(np.uint8)
+            #     save_path = os.path.join(render_dir, f'render_{i:03d}.png')
+            #     cv2.imwrite(save_path, render)
+            #     print(f"Saved coherent view image at {save_path}")
             # render from multiple views with higher resolution
             views = [
                 # front & back
@@ -674,80 +702,132 @@ class GUI:
                 (45, 0), (45, 90), (45, 180), (45, -90),
                 (-45, 0), (-45, 90), (-45, 180), (-45, -90),
             ]
-            clean_dir = "/work3/s222477/GaussianSeg/logs/clean"
+            # clean_dir = "/work3/s222477/GaussianSeg/logs/clean"
 
             # 一个用于将2D mask信息反向投影到3D高斯点云的过程。通过渲染不同视角下的3D模型，生成对应的2D图像，然后使用SAM（Segment Anything Model）生成mask，并将这些mask反向投影到3D点云中，为每个3D点赋予标签。
-            if final_pruned.labels is None or final_pruned.labels.shape[0] < final_pruned.num_gaussians:
-                final_pruned.labels = torch.zeros(final_pruned.num_gaussians, dtype=torch.long, device=self.device)
+            # 假设 3D 点存储在 renderer.gaussians.points 中，形状为 (N, 3)
+            points = self.renderer.gaussians.get_xyz  # tensor on device
+            points_cpu = points.detach().cpu().numpy()
+            num_points = points_cpu.shape[0]
 
-            for elev, azim in view_list:
-                masks_path = os.path.join(clean_dir, f"{elev}_{azim}")
-                if not os.path.exists(masks_path):
-                    continue
-                pose = orbit_camera(elev, azim, self.opt.radius)
-                cam = MiniCam(pose, self.opt.ref_size, self.opt.ref_size, self.cam.fovy, self.cam.fovx, self.cam.near, self.cam.far)
+            # 初始化每个点的标签为 0（未被任何 2D mask 标记）
+            labels = -torch.ones(num_points, dtype=torch.int32, device=self.device)
 
-                for fname in os.listdir(masks_path):
-                    if not fname.endswith(".png"):
-                        print(f"Warning: Mask directory {masks_path} not found. Skipping.")
-                        continue
-
-                    mask_id = int(os.path.splitext(fname)[0].split('_')[0])
-                    label_id = hash(f"{elev}_{azim}_{mask_id}") % (2**16)
-
-                    mask_img = cv2.imread(os.path.join(masks_path, fname), cv2.IMREAD_GRAYSCALE)
-                    mask_tensor = torch.from_numpy(mask_img).to(self.device) > 127
-                    
-                    breakpoint()
-
-                    proj_out = self.renderer.render(cam)
-                    visible = proj_out["visibility_filter"]
-                    proj_xyz = proj_out["viewspace_points"]#得到当前视角下可见的点
-
-                    with torch.no_grad():
-                        # 显示当前投影角度
-                        print(f"Back-projecting labels from azim={azim}, elev={elev}")
-                        coords = (proj_xyz[..., :2] / (proj_xyz[..., 2:3] + 1e-5)) * (self.opt.ref_size / 2)
-                        coords = coords + (self.opt.ref_size / 2)
-                        coords = coords.long().clamp(min=0, max=self.opt.ref_size - 1)
-
-                        in_mask = coords[..., 1] * self.opt.ref_size + coords[..., 0]
-                        final_pruned.labels[visible] = torch.where(
-                            mask_tensor.view(-1)[in_mask],
-                            label_id,
-                            final_pruned.labels[visible]
-                        )
+            # 遍历每个采样视角，将对应 refined mask 反向投影到 3D 点云
+            render_resolution = 512  # 与 texture extraction 时一致
+            proj_matrix = torch.from_numpy(self.cam.perspective.astype('float32')).to(self.device)
+            
             breakpoint()
             
+            for view_idx, (elev, azimuth) in enumerate(view_list):
+                # 根据当前视角计算相机位姿
+                pose = orbit_camera(elev, azimuth, self.opt.radius)
+                pose_tensor = torch.from_numpy(pose.astype('float32')).to(self.device)
 
-            with torch.no_grad():
-                c_view = MiniCam(
-                    self.cam.pose,
-                    self.opt.ref_size,
-                    self.opt.ref_size,
-                    self.cam.fovy,
-                    self.cam.fovx,
-                    self.cam.near,
-                    self.cam.far,
-                )
-                res = self.renderer.render(c_view)
-                visible = res["visibility_filter"]
-                coords = (res["viewspace_points"][..., :2] / (res["viewspace_points"][..., 2:3].abs() + 1e-5)) * (self.opt.ref_size / 2)
-                coords = coords.long().clamp(0, self.opt.ref_size - 1)
+                # 将 3D 点转换为齐次坐标
+                ones = torch.ones((points.shape[0], 1), device=self.device)
+                points_homog = torch.cat([points, ones], dim=1)  # (N, 4)
 
-                max_label = final_pruned.labels.max().item()
-                color_map = torch.randint(0, 256, (max_label + 1, 3), device=self.device, dtype=torch.uint8)
-                color_canvas = torch.zeros((self.opt.ref_size, self.opt.ref_size, 3), dtype=torch.uint8, device=self.device)
+                # 从世界坐标转换到相机坐标
+                inv_pose = torch.inverse(pose_tensor)
+                points_cam = points_homog @ inv_pose.T  # (N, 4)
 
-                inds = torch.where(visible)[0]
-                for i in inds:
-                    px, py = coords[i]
-                    lbl = final_pruned.labels[i].item()
-                    color_canvas[py, px] = color_map[lbl]
+                # 投影到 clip space
+                points_clip = points_cam @ proj_matrix.T  # (N, 4)
+                # 执行透视除法，得到 NDC 空间坐标
+                ndc = points_clip[:, :3] / (points_clip[:, 3:4] + 1e-8)
 
-                colored_mask = color_canvas.cpu().numpy()
-                cv2.imwrite("/work3/s222477/GaussianSeg/logs/colored_mask.png", colored_mask[..., ::-1])
+                # 将 NDC 坐标映射到像素坐标
+                # NDC 范围 [-1, 1] 映射到 [0, render_resolution]
+                u = ((ndc[:, 0] + 1) / 2) * render_resolution
+                v = ((1 - (ndc[:, 1] + 1) / 2)) * render_resolution  # 注意 y 轴翻转
+
+                u_np = u.detach().cpu().numpy()
+                v_np = v.detach().cpu().numpy()
+
+                # 加载当前视角对应的 refined mask（合并所有 mask 文件）
+                mask_dir = f"/work3/s222477/GaussianSeg/logs/clean/{elev}_{azimuth}"
+                combined_mask = None
+                for i, mask_file in enumerate(glob.glob(mask_dir + "/*.png"), start=1):
+                    mask_img = cv2.imread(mask_file, cv2.IMREAD_GRAYSCALE)
+                    # Use the file index "i" as the label value instead of 1.
+                    mask_id = 1 + (((elev + 90) * 10000 + (azimuth + 180) * 100 + i) % 254)
+                    _, mask_bin = cv2.threshold(mask_img, 127, mask_id, cv2.THRESH_BINARY)
+                    if combined_mask is None:
+                        combined_mask = mask_bin
+                    else:
+                        # For pixels where the new mask is active, assign its label; otherwise keep the previous label.
+                        combined_mask = np.where(mask_bin > 0, mask_bin, combined_mask)
+
+                # 对于每个 3D 点，检查投影后的像素是否落在 mask 内
+                for i in range(num_points):
+                    ui = int(round(u_np[i]))
+                    vi = int(round(v_np[i]))
+                    # 检查是否在图像范围内
+                    if ui < 0 or ui >= render_resolution or vi < 0 or vi >= render_resolution:
+                        continue
+                    if combined_mask[vi, ui] > 0:
+                        # 如果该点被多个视角标记，保留第一个检测到的标签
+                        if labels[i] < 0:
+                            labels[i] = view_idx + 1  # 标签赋值为视角编号（从1开始）
+
+            # 将标签赋值回 renderer.gaussians
+            self.renderer.gaussians.labels = labels
+            print("[INFO] 反向投影完成，为 3D 点云中的每个点赋予了标签。")
+
         breakpoint()
+        # 确保点云和标签已经存在
+        points = self.renderer.gaussians.get_xyz.detach()
+        labels_tensor = self.renderer.gaussians.labels.detach()
+        if points is None or labels_tensor is None:
+            print("没有可用于渲染的点云数据或标签。")
+        else:
+            # 为每个正标签生成一个随机颜色
+            unique_labels = labels_tensor.unique()
+            label_colors = {}
+            for lab in unique_labels.cpu().numpy():
+                if lab < 0:
+                    continue
+                label_colors[int(lab)] = np.random.randint(0, 255, size=3).tolist()
+            default_color = [200, 200, 200]  # 对于未标记的点
+
+            # 将3D点投影到2D平面，使用当前摄像机参数
+            points_cpu = points.cpu().numpy()  # (N, 3)
+            N = points_cpu.shape[0]
+            ones = np.ones((N, 1), dtype=np.float32)
+            points_homog = np.concatenate([points_cpu, ones], axis=1)  # (N, 4)
+
+            # 使用 self.cam.pose 和 self.cam.perspective 进行投影
+            pose = self.cam.pose            # (4, 4) numpy数组
+            proj = self.cam.perspective.astype(np.float32)
+            inv_pose = np.linalg.inv(pose)
+
+            points_cam = points_homog @ inv_pose.T  # 转换到摄像机坐标系
+            points_clip = points_cam @ proj.T       # 转换到裁剪空间
+            ndc = points_clip[:, :3] / (points_clip[:, 3:4] + 1e-8)  # 归一化设备坐标
+
+            # 将NDC坐标映射到像素坐标
+            u = ((ndc[:, 0] + 1) / 2) * self.W
+            v = ((1 - (ndc[:, 1] + 1) / 2)) * self.H
+
+            # 创建一个空白画布（白色背景）
+            canvas = np.full((self.H, self.W, 3), 255, dtype=np.uint8)
+
+            # 根据标签给每个点上色，并在画布上绘制小圆点
+            for i in range(N):
+                ui = int(round(u[i]))
+                vi = int(round(v[i]))
+                if ui < 0 or ui >= self.W or vi < 0 or vi >= self.H:
+                    continue
+                lab = int(labels_tensor[i].item())
+                color = label_colors.get(lab, default_color)
+                cv2.circle(canvas, (ui, vi), 1, color, -1)
+
+            # 保存渲染出的点云图像
+            output_path = os.path.join(self.opt.outdir, "point_cloud_labels.png")
+            cv2.imwrite(output_path, canvas)
+            print(f"已保存点云标记图像：{output_path}")
+
         # save
         self.save_model(mode='model')
         self.save_model(mode='geo+tex')
@@ -756,14 +836,16 @@ class GUI:
 if __name__ == "__main__":
     import argparse
     from omegaconf import OmegaConf
+    import glob
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, help="path to the yaml config file")
-    parser.add_argument("--seg", required=True, help="path to the segmentation file")
+    # parser.add_argument("--seg", required=True, help="path to the segmentation file")
     args, extras = parser.parse_known_args()
 
     # override default config from cli
     opt = OmegaConf.merge(OmegaConf.load(args.config), OmegaConf.from_cli(extras))
-    opt.seg = args.seg
+    # opt.seg = args.seg
     gui = GUI(opt)
 
     if opt.gui:
