@@ -1,7 +1,7 @@
 # GaussianSeg
 ## pipeline
 
-'https://docs.google.com/document/d/1C5G-zz1GJxktA-yqDoAbEAJJfyRh2vVJcT0OEjUmKcg/edit?usp=sharing'
+记录'https://docs.google.com/document/d/1C5G-zz1GJxktA-yqDoAbEAJJfyRh2vVJcT0OEjUmKcg/edit?usp=sharing'
 Flow
 'https://www.figma.com/design/hBCBb2nz4zmrlWOtARmQIl/Untitled?node-id=0-1&t=5xLodQL2wHXQ1cBh-1'
 
