@@ -2,6 +2,7 @@
 ## pipeline
 
 记录'https://docs.google.com/document/d/1C5G-zz1GJxktA-yqDoAbEAJJfyRh2vVJcT0OEjUmKcg/edit?usp=sharing'
+
 Flow
 'https://www.figma.com/design/hBCBb2nz4zmrlWOtARmQIl/Untitled?node-id=0-1&t=5xLodQL2wHXQ1cBh-1'
 
@@ -32,6 +33,9 @@ pip install git+https://github.com/ashawkey/kiuikit
 
 # # To use ImageDream, also install:
 # pip install git+https://github.com/bytedance/ImageDream/#subdirectory=extern/ImageDream
+
+download sam checkpoint and save it in /weights
+wget https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth
 
 python -m pip install 'git+https://github.com/facebookresearch/detectron2.git'
 ```
