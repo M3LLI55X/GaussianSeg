@@ -213,7 +213,7 @@ def refine_masks(result_path, view, leave_index=None):
         # Filter masks with high overlap
         for m, mask in enumerate(masks):
             union = (mask & masks[m + 1:]).sum((1, 2), True)
-            masks[m + 1:] |= mask & (union > .86 * mask.sum((0, 1), True)) #判断重叠区域是否超过当前掩码90%
+            masks[m + 1:] |= mask & (union > .9 * mask.sum((0, 1), True)) #判断重叠区域是否超过当前掩码90%
         
         # Identify and visualize disjoint patches
         unique, indices = masks.flatten(1).unique(return_inverse=True, dim=1)
@@ -229,17 +229,17 @@ def refine_masks(result_path, view, leave_index=None):
             kernel = np.ones((3,3), np.uint8)
             opening = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
             white_pixels = np.sum(opening == 255)
-            if white_pixels < 400: continue # filter tiny region
+            if white_pixels < 100: continue # filter tiny region
             
             # find connected components
             n_components, output, stats, centroids = cv2.connectedComponentsWithStats(opening, connectivity=8)
 
             for label in range(1, n_components):  # filter tiny region
                 mask = output == label
-                if mask.sum() < 300: continue
+                if mask.sum() < 100: continue
                 mask_list.append((mask*255).astype('uint8'))
 
-        mean_threshold, stddev_threshold = 5,4 # merge threshold
+        mean_threshold, stddev_threshold = 6, 5  # merge threshold
         mask_list_updated = process_mask_list(image, mask_list, mean_threshold, stddev_threshold)
 
         ori_image = Image.open(ori_image_pth).convert('RGB')
@@ -269,9 +269,3 @@ def refine_masks(result_path, view, leave_index=None):
         for i, mask in enumerate(mask_list_updated_new, 1):
             img = Image.fromarray(mask)
             img.save(f'{folder_path}/{i}_mask.png')
-
-            # demo = visual.draw_binary_mask_with_number(mask, text=str(i), label_mode='1', alpha=0.05, anno_mode=['Mask', 'Mark'])
-
-        # im = demo.get_image() 
-        # im_pil = Image.fromarray(im)
-        # im_pil.save(f'{folder_path}/full.jpg')

@@ -159,6 +159,7 @@ class GaussianModel:
         self.spatial_lr_scale = 0
         self.setup_functions()
         self.labels=None
+        self.material=None
 
     def capture(self):
         return (

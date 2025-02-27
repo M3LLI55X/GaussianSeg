@@ -18,10 +18,7 @@ from mesh import Mesh, safe_normalize
 
 import os
 from segment_anything import sam_model_registry, SamAutomaticMaskGenerator, SamPredictor
-from segmentation import load_mask_image, load_json_result, create_material_mapping, \
-                        generate_material_array, load_and_resize_masks, load_all_mask_images, \
-                        create_large_matrix, merge_masks_into_large_matrix, create_color_mapping, \
-                        generate_color_image, save_color_image, refine_masks, process_mask_list
+from segmentation import refine_masks
 class GUI:
     def __init__(self, opt):
         self.opt = opt  # shared with the trainer's opt to support in-place modification of rendering parameters.
@@ -549,7 +546,7 @@ class GUI:
             self.prepare_train()
             for i in tqdm.trange(iters):
                 self.train_step()
-            # do a last prune
+            # do the last prune 
             self.renderer.gaussians.prune(min_opacity=0.01, extent=1, max_screen_size=1)
             
             #current gaussians
@@ -637,11 +634,11 @@ class GUI:
             mask_generator = SamAutomaticMaskGenerator(
                 sam,
                 points_per_side=32,
-                pred_iou_thresh=0.95,
-                stability_score_thresh=0.95,
+                pred_iou_thresh=0.96,
+                stability_score_thresh=0.92,
                 crop_n_layers=1,
-                crop_n_points_downscale_factor=2,
-                min_mask_region_area=400,
+                crop_n_points_downscale_factor=1,
+                min_mask_region_area=100,
                 output_mode="binary_mask",  # 只输出二值mask
             )
             
@@ -685,6 +682,7 @@ class GUI:
                     cv2.imwrite(save_path, mask_img)
 
             # Process each view directory to get clean masks
+            breakpoint()
             for elevation, azimuth in views:  # 解包元组
                 view_str = f'view_{elevation}_{azimuth}'  # 构造路径字符串
                 mask_dir = os.path.join(result_path, view_str)  # 使用字符串构造路径
@@ -694,7 +692,7 @@ class GUI:
                     refine_masks(mask_dir, ori_view)
                 else:
                     print(f"Warning: Mask directory {mask_dir} not found for view {view_str}.")
-
+            
             # back-project masks to 3D
             view_list = [
                 (0, 0), (0, 180),
