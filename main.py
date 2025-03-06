@@ -19,6 +19,10 @@ from mesh import Mesh, safe_normalize
 import os
 from segment_anything import sam_model_registry, SamAutomaticMaskGenerator, SamPredictor
 from segmentation import refine_masks
+
+import subprocess
+import sys
+
 class GUI:
     def __init__(self, opt):
         self.opt = opt  # shared with the trainer's opt to support in-place modification of rendering parameters.
@@ -549,9 +553,6 @@ class GUI:
             # do the last prune 
             self.renderer.gaussians.prune(min_opacity=0.01, extent=1, max_screen_size=1)
             
-            #current gaussians
-            final_pruned = self.renderer.gaussians
-            # Increase render resolution for higher quality
             high_res = 512 # Increased from default ref_size
             # 渲染100张final_pruned的连贯视角图片保存在logs/100中
             # render_dir = 'logs/100'
@@ -612,11 +613,13 @@ class GUI:
                     render = np.transpose(render, (1, 2, 0))
                 if render.shape[2] > 3:
                     render = render[..., :3]
-                    
-                render = (render * 255).astype(np.uint8)
+
+                render = render.astype(np.float32)  
+                render_bgr = render[:,:,::-1]  # RGB → BGR
+                render_bgr = (render_bgr * 255).astype(np.uint8)
                 all_renders.append(render)
                 save_path = f'/work3/s222477/GaussianSeg/logs/render_results/render_{elevation}_{azimuth}.png'
-                cv2.imwrite(save_path, render)
+                cv2.imwrite(save_path, render_bgr)
                 print(f"Saved render img at {save_path}")
 
             os.makedirs(f'/work3/s222477/GaussianSeg/logs/seg_results', exist_ok=True)
@@ -681,8 +684,39 @@ class GUI:
                     save_path = os.path.join(view_dir, f'mask_{j}.png')
                     cv2.imwrite(save_path, mask_img)
 
+            # Create combined mask visualizations separately after all masks are saved
+            print("[INFO] Creating combined mask visualizations...")
+            rsual_path = f'/work3/s222477/GaussianSeg/logs/seg_results_visual'
+            os.makedirs(rsual_path, exist_ok=True)           
+            for i, (elevation, azimuth) in enumerate(views):
+                view_dir = os.path.join(result_path, f'view_{elevation}_{azimuth}')
+                mask_files = sorted(glob.glob(os.path.join(view_dir, 'mask_*.png')))
+                # Create a blank colored mask image (black background)
+                combined_mask = np.zeros((high_res, high_res, 3), dtype=np.uint8)
+                
+                # Add each mask with a unique color
+                for j, mask_file in enumerate(mask_files):
+                    mask = cv2.imread(mask_file, cv2.IMREAD_GRAYSCALE)
+                    if mask is None or not mask.any():
+                        continue
+                        
+                    # Generate a random color (BGR)
+                    color = np.random.randint(50, 256, size=3).tolist()
+                    
+                    # Add colored mask to the combined image
+                    mask_region = (mask > 127)
+                    combined_mask[mask_region] = color
+                
+                # Save the combined mask image
+                combined_path = os.path.join(rsual_path, f'{elevation}_{azimuth}.png')
+                cv2.imwrite(combined_path, combined_mask)
+            print(f"Created combined mask")
+
+
+
+
+            # breakpoint()
             # Process each view directory to get clean masks
-            breakpoint()
             for elevation, azimuth in views:  # 解包元组
                 view_str = f'view_{elevation}_{azimuth}'  # 构造路径字符串
                 mask_dir = os.path.join(result_path, view_str)  # 使用字符串构造路径
@@ -690,9 +724,61 @@ class GUI:
                     print(f"Refining masks in {view_str}...")
                     ori_view = f'{elevation}_{azimuth}' 
                     refine_masks(mask_dir, ori_view)
-                else:
-                    print(f"Warning: Mask directory {mask_dir} not found for view {view_str}.")
+
+            clean_dir = "/work3/s222477/GaussianSeg/logs/clean"
+            cclean_path =  f'/work3/s222477/GaussianSeg/logs/clean_visual'
+            if not os.path.exists(cclean_path):
+                os.makedirs(cclean_path, exist_ok=True)
+            for i, (elevation, azimuth) in enumerate(views):
+                view_dir = os.path.join(clean_dir, f'{elevation}_{azimuth}')
+                mask_files = sorted(glob.glob(os.path.join(view_dir, '*_mask.png')))
+                # Create a blank colored mask image (black background)
+                combined_mask = np.zeros((high_res, high_res, 3), dtype=np.uint8)
+                
+                # Add each mask with a unique color
+                for j, mask_file in enumerate(mask_files):
+                    mask = cv2.imread(mask_file, cv2.IMREAD_GRAYSCALE)
+                    color = np.random.randint(50, 256, size=3).tolist()
+                    
+                    # Add colored mask to the combined image
+                    mask_region = (mask > 127)
+                    combined_mask[mask_region] = color
+                
+                # Save the combined mask image
+                combined_path = os.path.join(cclean_path, f'{elevation}_{azimuth}.png')
+                cv2.imwrite(combined_path, combined_mask)
+
+            print(f"Created combined mask")
+
+            # breakpoint()
+
+
+
             
+            try:
+                gpt_test_path = "/work3/s222477/GaussianSeg/gpt_test.py"
+                subprocess.run([sys.executable, gpt_test_path], check=True)
+                print("[INFO] gpt_test.py执行完成")
+            except subprocess.CalledProcessError as e:
+                print(f"[ERROR] gpt_test.py执行失败: {e}")
+            
+            # folder_path='/work3/s222477/GaussianSeg/logs'
+            # leave_list= views
+            
+            # Load valid materials
+            # material_matrices = generate_material_matrices(folder_path, leave_list)
+            
+
+
+            # breakpoint()
+            # # Create material matrices for each view based on GPT-4V results
+            print("[INFO] Generating material matrices...")
+
+
+            # breakpoint()
+
+
+
             # back-project masks to 3D
             view_list = [
                 (0, 0), (0, 180),
@@ -700,8 +786,7 @@ class GUI:
                 (45, 0), (45, 90), (45, 180), (45, -90),
                 (-45, 0), (-45, 90), (-45, 180), (-45, -90),
             ]
-            # clean_dir = "/work3/s222477/GaussianSeg/logs/clean"
-
+            
             # 一个用于将2D mask信息反向投影到3D高斯点云的过程。通过渲染不同视角下的3D模型，生成对应的2D图像，然后使用SAM（Segment Anything Model）生成mask，并将这些mask反向投影到3D点云中，为每个3D点赋予标签。
             # 假设 3D 点存储在 renderer.gaussians.points 中，形状为 (N, 3)
             points = self.renderer.gaussians.get_xyz  # tensor on device
@@ -715,7 +800,7 @@ class GUI:
             render_resolution = 512  # 与 texture extraction 时一致
             proj_matrix = torch.from_numpy(self.cam.perspective.astype('float32')).to(self.device)
             
-            breakpoint()
+            # breakpoint()
             
             for view_idx, (elev, azimuth) in enumerate(view_list):
                 # 根据当前视角计算相机位姿
@@ -743,50 +828,97 @@ class GUI:
                 u_np = u.detach().cpu().numpy()
                 v_np = v.detach().cpu().numpy()
 
-                # 加载当前视角对应的 refined mask（合并所有 mask 文件）
-                mask_dir = f"/work3/s222477/GaussianSeg/logs/clean/{elev}_{azimuth}"
-                combined_mask = None
-                for i, mask_file in enumerate(glob.glob(mask_dir + "/*.png"), start=1):
-                    mask_img = cv2.imread(mask_file, cv2.IMREAD_GRAYSCALE)
-                    # Use the file index "i" as the label value instead of 1.
-                    mask_id = 1 + (((elev + 90) * 10000 + (azimuth + 180) * 100 + i) % 254)
-                    _, mask_bin = cv2.threshold(mask_img, 127, mask_id, cv2.THRESH_BINARY)
-                    if combined_mask is None:
-                        combined_mask = mask_bin
+                # 加载当前视角对应的material_vis图像
+                mask_dir = f"/work3/s222477/GaussianSeg/logs/material_matrices"
+                mask_file = f"{mask_dir}/material_vis_{elev}_{azimuth}.png"
+                
+                # Initialize a dictionary to track label votes for each point
+                if not hasattr(self, 'label_votes'):
+                    self.label_votes = [{} for _ in range(num_points)]
+                    
+                if os.path.exists(mask_file):
+                    # 加载彩色mask图像
+                    mask_img = cv2.imread(mask_file, cv2.IMREAD_COLOR)
+                    
+                    # Calculate view confidence based on camera angle
+                    view_confidence = 1.0
+                    
+                    # 对于每个3D点，检查投影后的像素位置的材质颜色
+                    for i in range(num_points):
+                        ui = int(round(u_np[i]))
+                        vi = int(round(v_np[i]))
+                        # 检查是否在图像范围内
+                        if 0 <= ui < render_resolution and 0 <= vi < render_resolution:
+                            # 获取该像素的颜色
+                            color = mask_img[vi, ui]
+                            # 如果不是黑色背景(有材质标记)
+                            if color.any() > 0:
+                                # 将颜色值转换为单一标签值(保留BGR颜色信息)
+                                label_value = (int(color[0]) << 16) | (int(color[1]) << 8) | int(color[2])
+                                
+                                # 累加该点对应标签的票数
+                                if label_value not in self.label_votes[i]:
+                                    self.label_votes[i][label_value] = 0
+                                # 加权投票 (可以根据视角质量进行调整)
+                                self.label_votes[i][label_value] += view_confidence
+                else:
+                    print(f"Warning: Material visualization not found at {mask_file}")
+
+            # 处理完所有视角后，为每个点分配最多票数的标签
+            # Define misc label (you may need to adjust this based on your specific case)
+            misc_label = 8421504  # Example value (RGB 128,128,128)
+
+            for i in range(num_points):
+                if self.label_votes[i]:  # 如果该点有任何标签投票
+                    # 分离misc和非misc标签的投票
+                    non_misc_votes = {label: votes for label, votes in self.label_votes[i].items() 
+                                     if label != misc_label}
+                    
+                    # 优先选择非misc标签中得票最多的
+                    if non_misc_votes:
+                        max_label = max(non_misc_votes.items(), key=lambda x: x[1])[0]
                     else:
-                        # For pixels where the new mask is active, assign its label; otherwise keep the previous label.
-                        combined_mask = np.where(mask_bin > 0, mask_bin, combined_mask)
-
-                # 对于每个 3D 点，检查投影后的像素是否落在 mask 内
-                for i in range(num_points):
-                    ui = int(round(u_np[i]))
-                    vi = int(round(v_np[i]))
-                    # 检查是否在图像范围内
-                    if ui < 0 or ui >= render_resolution or vi < 0 or vi >= render_resolution:
-                        continue
-                    if combined_mask[vi, ui] > 0:
-                        # 如果该点被多个视角标记，保留第一个检测到的标签
-                        if labels[i] < 0:
-                            labels[i] = view_idx + 1  # 标签赋值为视角编号（从1开始）
-
+                        # 如果只有misc标签，则使用所有标签中得票最多的
+                        max_label = max(self.label_votes[i].items(), key=lambda x: x[1])[0]
+                    
+                    labels[i] = max_label
             # 将标签赋值回 renderer.gaussians
             self.renderer.gaussians.labels = labels
-            print("[INFO] 反向投影完成，为 3D 点云中的每个点赋予了标签。")
+            print("[INFO] Reverse project complete with voting-based label assignment")
 
-        breakpoint()
+        # 加载材质颜色映射
+        material_colors_file = "/work3/s222477/GaussianSeg/weights/material_colors.json"
+        if os.path.exists(material_colors_file):
+            with open(material_colors_file, 'r') as f:
+                material_colors_map = json.load(f)
+        else:
+            print(f"Warning: Material colors file not found at {material_colors_file}")
+            material_colors_map = {}
+
         # 确保点云和标签已经存在
         points = self.renderer.gaussians.get_xyz.detach()
         labels_tensor = self.renderer.gaussians.labels.detach()
         if points is None or labels_tensor is None:
-            print("没有可用于渲染的点云数据或标签。")
+            print("there is no label。")
         else:
-            # 为每个正标签生成一个随机颜色
-            unique_labels = labels_tensor.unique()
+            # 创建一个颜色映射，将标签值映射回原始RGB颜色
             label_colors = {}
-            for lab in unique_labels.cpu().numpy():
+            for lab in labels_tensor.unique().cpu().numpy():
                 if lab < 0:
                     continue
-                label_colors[int(lab)] = np.random.randint(0, 255, size=3).tolist()
+                # 从标签值中提取原始BGR颜色
+                b = (lab >> 16) & 0xFF
+                g = (lab >> 8) & 0xFF
+                r = lab & 0xFF
+                # 转换为RGB格式
+                color_key = f"{r},{g},{b}"
+                # 尝试从material_colors.json获取对应的材质颜色
+                if color_key in material_colors_map:
+                    label_colors[int(lab)] = material_colors_map[color_key]
+                else:
+                    # 如果在JSON中找不到，则使用提取的原始颜色
+                    label_colors[int(lab)] = [r, g, b]
+            
             default_color = [200, 200, 200]  # 对于未标记的点
 
             # 将3D点投影到2D平面，使用当前摄像机参数
@@ -818,7 +950,14 @@ class GUI:
                 if ui < 0 or ui >= self.W or vi < 0 or vi >= self.H:
                     continue
                 lab = int(labels_tensor[i].item())
-                color = label_colors.get(lab, default_color)
+                if lab >= 0:  # 只处理有效的标签
+                    # 直接从标签值中提取BGR颜色
+                    b = (lab >> 16) & 0xFF
+                    g = (lab >> 8) & 0xFF
+                    r = lab & 0xFF
+                    color = [b, g, r]  # OpenCV使用BGR顺序
+                else:
+                    color = default_color
                 cv2.circle(canvas, (ui, vi), 1, color, -1)
 
             # 保存渲染出的点云图像
@@ -835,6 +974,7 @@ if __name__ == "__main__":
     import argparse
     from omegaconf import OmegaConf
     import glob
+    import json
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, help="path to the yaml config file")

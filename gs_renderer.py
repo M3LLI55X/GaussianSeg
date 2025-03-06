@@ -815,27 +815,6 @@ class Renderer:
 
         rendered_image = rendered_image.clamp(0, 1)
 
-        # segment the image
-        # segmentation = torch.zeros((viewpoint_camera.image_height, viewpoint_camera.image_width), dtype=torch.long, device="cuda")
-        # for i in range(viewpoint_camera.image_height):
-        #     for j in range(viewpoint_camera.image_width):
-        #         pixel_contributions = contributions[:, i, j]  # [N]
-        #         labels = self.gaussians.labels  # [N]
-        #         max_idx = pixel_contributions.argmax()
-        #         segmentation[i, j] = labels[max_idx]
-        # for i in range(viewpoint_camera.image_height):
-        #     for j in range(viewpoint_camera.image_width):
-        #         # 获取高斯对像素 (i, j) 的贡献
-        #         pixel_contributions = contributions[:, i, j]  # [N]
-        #         # 获取高斯的标签
-        #         labels = self.gaussians.labels  # [N]
-        #         # 确定贡献最大的标签
-        #         max_idx = pixel_contributions.argmax()
-        #         segmentation[i, j] = labels[max_idx]
-
-        
-        # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
-        # They will be excluded from value updates used in the splitting criteria.
         return {
             "image": rendered_image,
             "depth": rendered_depth,

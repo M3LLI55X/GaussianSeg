@@ -269,3 +269,8 @@ def refine_masks(result_path, view, leave_index=None):
         for i, mask in enumerate(mask_list_updated_new, 1):
             img = Image.fromarray(mask)
             img.save(f'{folder_path}/{i}_mask.png')
+            demo = visual.draw_binary_mask_with_number(mask, text=str(i), label_mode='1', alpha=0.05, anno_mode=['Mask', 'Mark'])
+
+        im = demo.get_image() 
+        im_pil = Image.fromarray(im)
+        im_pil.save(f'{folder_path}/full.jpg')
