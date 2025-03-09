@@ -455,12 +455,6 @@ class GUI:
                 cur_out = self.renderer.render(cur_cam)
 
                 rgbs = cur_out["image"].unsqueeze(0) # [1, 3, H, W] in [0, 1]
-
-                # enhance texture quality with zero123 [not working well]
-                # if self.opt.guidance_model == 'zero123':
-                #     rgbs = self.guidance.refine(rgbs, [ver], [hor], [0])
-                    # import kiui
-                    # kiui.vis.plot_image(rgbs)
                     
                 # get coordinate in texture image
                 pose = torch.from_numpy(pose.astype(np.float32)).to(self.device)
@@ -622,6 +616,10 @@ class GUI:
                 cv2.imwrite(save_path, render_bgr)
                 print(f"Saved render img at {save_path}")
 
+
+
+
+            
             os.makedirs(f'/work3/s222477/GaussianSeg/logs/seg_results', exist_ok=True)
             result_path = f'/work3/s222477/GaussianSeg/logs/seg_results'
 
@@ -712,10 +710,6 @@ class GUI:
                 cv2.imwrite(combined_path, combined_mask)
             print(f"Created combined mask")
 
-
-
-
-            # breakpoint()
             # Process each view directory to get clean masks
             for elevation, azimuth in views:  # 解包元组
                 view_str = f'view_{elevation}_{azimuth}'  # 构造路径字符串
@@ -750,10 +744,11 @@ class GUI:
 
             print(f"Created combined mask")
 
-            # breakpoint()
+            
 
 
 
+            
             
             try:
                 gpt_test_path = "/work3/s222477/GaussianSeg/gpt_test.py"
@@ -762,20 +757,9 @@ class GUI:
             except subprocess.CalledProcessError as e:
                 print(f"[ERROR] gpt_test.py执行失败: {e}")
             
-            # folder_path='/work3/s222477/GaussianSeg/logs'
-            # leave_list= views
             
-            # Load valid materials
-            # material_matrices = generate_material_matrices(folder_path, leave_list)
-            
-
-
-            # breakpoint()
-            # # Create material matrices for each view based on GPT-4V results
             print("[INFO] Generating material matrices...")
 
-
-            # breakpoint()
 
 
 
@@ -787,7 +771,7 @@ class GUI:
                 (-45, 0), (-45, 90), (-45, 180), (-45, -90),
             ]
             
-            # 一个用于将2D mask信息反向投影到3D高斯点云的过程。通过渲染不同视角下的3D模型，生成对应的2D图像，然后使用SAM（Segment Anything Model）生成mask，并将这些mask反向投影到3D点云中，为每个3D点赋予标签。
+            # 一个用于将2D mask信息反向投影到3D高斯点云的过程。通过渲染不同视角下的3D模型，生成对应的2D图像，然后将带分割信息的mask反向投影到3D点云中，为每个3D点赋予标签。
             # 假设 3D 点存储在 renderer.gaussians.points 中，形状为 (N, 3)
             points = self.renderer.gaussians.get_xyz  # tensor on device
             points_cpu = points.detach().cpu().numpy()
@@ -800,7 +784,6 @@ class GUI:
             render_resolution = 512  # 与 texture extraction 时一致
             proj_matrix = torch.from_numpy(self.cam.perspective.astype('float32')).to(self.device)
             
-            # breakpoint()
             
             for view_idx, (elev, azimuth) in enumerate(view_list):
                 # 根据当前视角计算相机位姿
@@ -839,7 +822,8 @@ class GUI:
                 if os.path.exists(mask_file):
                     # 加载彩色mask图像
                     mask_img = cv2.imread(mask_file, cv2.IMREAD_COLOR)
-                    
+                    mask_img = cv2.flip(mask_img, 0)
+    
                     # Calculate view confidence based on camera angle
                     view_confidence = 1.0
                     
@@ -864,6 +848,8 @@ class GUI:
                 else:
                     print(f"Warning: Material visualization not found at {mask_file}")
 
+                # breakpoint()
+
             # 处理完所有视角后，为每个点分配最多票数的标签
             # Define misc label (you may need to adjust this based on your specific case)
             misc_label = 8421504  # Example value (RGB 128,128,128)
@@ -882,6 +868,7 @@ class GUI:
                         max_label = max(self.label_votes[i].items(), key=lambda x: x[1])[0]
                     
                     labels[i] = max_label
+                    # breakpoint()
             # 将标签赋值回 renderer.gaussians
             self.renderer.gaussians.labels = labels
             print("[INFO] Reverse project complete with voting-based label assignment")
@@ -968,7 +955,204 @@ class GUI:
         # save
         self.save_model(mode='model')
         self.save_model(mode='geo+tex')
-        
+
+
+
+
+        # Extract separate meshes for each material based on labels
+        print("[INFO] Extracting labeled meshes...")
+        if hasattr(self.renderer.gaussians, 'labels') and self.renderer.gaussians.labels is not None:
+            # Get unique labels
+            unique_labels = self.renderer.gaussians.labels.unique()
+            unique_labels = unique_labels[unique_labels >= 0]  # Filter out negative (unlabeled) values
+            
+            print(f"[INFO] Found {len(unique_labels)} unique labels to extract")
+            
+            # Save a material info JSON file
+            material_info = {}
+            
+            # For each label, extract a separate mesh
+            for idx, label in enumerate(unique_labels):
+                label_int = int(label.item())
+                # Convert label value back to RGB color for display
+                b = (label_int >> 16) & 0xFF
+                g = (label_int >> 8) & 0xFF
+                r = label_int & 0xFF
+                color_name = f"material_{r}_{g}_{b}"
+                
+                # Print progress
+                print(f"[INFO] Extracting mesh for label {idx+1}/{len(unique_labels)}: {color_name}")
+                
+                # Create mask for current label
+                mask = (self.renderer.gaussians.labels == label)
+                n_points = mask.sum().item()
+                if n_points < 10:  # Skip if too few points
+                    print(f"[WARNING] Label {color_name} has only {n_points} points. Skipping.")
+                    continue
+                    
+                # Save original parameters
+                orig_xyz = self.renderer.gaussians._xyz
+                orig_features_dc = self.renderer.gaussians._features_dc
+                orig_features_rest = self.renderer.gaussians._features_rest
+                orig_scaling = self.renderer.gaussians._scaling
+                orig_rotation = self.renderer.gaussians._rotation
+                orig_opacity = self.renderer.gaussians._opacity
+                
+                # Initialize material info dictionary for this label
+                material_info[color_name] = {
+                    "color": [int(r), int(g), int(b)],
+                    "point_count": int(n_points)
+                }
+                
+                # Filter parameters to only include current label
+                try:
+                    self.renderer.gaussians._xyz = torch.nn.Parameter(orig_xyz[mask])
+                    self.renderer.gaussians._features_dc = torch.nn.Parameter(orig_features_dc[mask])
+                    self.renderer.gaussians._features_rest = torch.nn.Parameter(orig_features_rest[mask]) 
+                    self.renderer.gaussians._scaling = torch.nn.Parameter(orig_scaling[mask])
+                    self.renderer.gaussians._rotation = torch.nn.Parameter(orig_rotation[mask])
+                    self.renderer.gaussians._opacity = torch.nn.Parameter(orig_opacity[mask])
+                    
+                    # Extract mesh for this label with proper file extension
+                    mesh_path = os.path.join(self.opt.outdir, f"{self.opt.save_path}_mesh_{label_int}.{self.opt.mesh_format}")
+                    material_info[color_name]["file"] = os.path.basename(mesh_path)
+                    
+                    mesh = self.renderer.gaussians.extract_mesh(mesh_path, self.opt.density_thresh)
+
+                    # Extract texture
+                    print(f"[INFO] Extracting texture for {color_name}...")
+                    texture_size = 1024
+                    h = w = texture_size
+                    mesh.auto_uv()
+                    mesh.auto_normal()
+
+                    albedo = torch.zeros((h, w, 3), device=self.device, dtype=torch.float32)
+                    cnt = torch.zeros((h, w, 1), device=self.device, dtype=torch.float32)
+
+                    vers = [0] * 8 + [-45] * 8 + [45] * 8 + [-89.9, 89.9]
+                    hors = [0, 45, -45, 90, -90, 135, -135, 180] * 3 + [0, 0]
+                    render_resolution = 512
+
+                    import nvdiffrast.torch as dr
+                    if not self.opt.force_cuda_rast and (not self.opt.gui or os.name == 'nt'):
+                        glctx = dr.RasterizeGLContext()
+                    else:
+                        glctx = dr.RasterizeCudaContext()
+
+                    for ver, hor in zip(vers, hors):
+                        # 渲染当前视角下的图像
+                        pose = orbit_camera(ver, hor, self.cam.radius)
+                        cur_cam = MiniCam(
+                            pose,
+                            render_resolution,
+                            render_resolution,
+                            self.cam.fovy,
+                            self.cam.fovx,
+                            self.cam.near,
+                            self.cam.far,
+                        )
+                        
+                        cur_out = self.renderer.render(cur_cam)
+                        rgbs = cur_out["image"].unsqueeze(0)
+                        
+                        # 投影到纹理空间
+                        pose = torch.from_numpy(pose.astype(np.float32)).to(self.device)
+                        proj = torch.from_numpy(self.cam.perspective.astype(np.float32)).to(self.device)
+                        
+                        v_cam = torch.matmul(F.pad(mesh.v, pad=(0, 1), mode='constant', value=1.0), torch.inverse(pose).T).float().unsqueeze(0)
+                        v_clip = v_cam @ proj.T
+                        rast, rast_db = dr.rasterize(glctx, v_clip, mesh.f, (render_resolution, render_resolution))
+                        
+                        depth, _ = dr.interpolate(-v_cam[..., [2]], rast, mesh.f)
+                        depth = depth.squeeze(0)
+                        
+                        alpha = (rast[0, ..., 3:] > 0).float()
+                        uvs, _ = dr.interpolate(mesh.vt.unsqueeze(0), rast, mesh.ft)
+                        
+                        normal, _ = dr.interpolate(mesh.vn.unsqueeze(0).contiguous(), rast, mesh.fn)
+                        normal = safe_normalize(normal[0])
+                        
+                        rot_normal = normal @ pose[:3, :3]
+                        viewcos = rot_normal[..., [2]]
+                        
+                        mask = (alpha > 0) & (viewcos > 0.5)
+                        mask = mask.view(-1)
+                        
+                        uvs = uvs.view(-1, 2).clamp(0, 1)[mask]
+                        rgbs = rgbs.view(3, -1).permute(1, 0)[mask].contiguous()
+                        
+                        cur_albedo, cur_cnt = mipmap_linear_grid_put_2d(
+                            h, w,
+                            uvs[..., [1, 0]] * 2 - 1,
+                            rgbs,
+                            min_resolution=256,
+                            return_count=True,
+                        )
+                        
+                        mask = cnt.squeeze(-1) < 0.1
+                        albedo[mask] += cur_albedo[mask]
+                        cnt[mask] += cur_cnt[mask]
+
+                    # 处理纹理
+                    mask = cnt.squeeze(-1) > 0
+                    albedo[mask] = albedo[mask] / cnt[mask].repeat(1, 3)
+                    mask = mask.view(h, w)
+
+                    albedo = albedo.detach().cpu().numpy()
+                    mask = mask.detach().cpu().numpy()
+
+                    # 扩展纹理填充空洞
+                    from sklearn.neighbors import NearestNeighbors
+                    from scipy.ndimage import binary_dilation, binary_erosion
+
+                    inpaint_region = binary_dilation(mask, iterations=32)
+                    inpaint_region[mask] = 0
+
+                    search_region = mask.copy()
+                    not_search_region = binary_erosion(search_region, iterations=3)
+                    search_region[not_search_region] = 0
+
+                    search_coords = np.stack(np.nonzero(search_region), axis=-1)
+                    inpaint_coords = np.stack(np.nonzero(inpaint_region), axis=-1)
+
+                    knn = NearestNeighbors(n_neighbors=1, algorithm="kd_tree").fit(search_coords)
+                    _, indices = knn.kneighbors(inpaint_coords)
+
+                    albedo[tuple(inpaint_coords.T)] = albedo[tuple(search_coords[indices[:, 0]].T)]
+
+                    mesh.albedo = torch.from_numpy(albedo).to(self.device)
+                    
+                    # Save texture
+                    texture_path = os.path.join(self.opt.outdir, f"{self.opt.save_path}_mesh_{label_int}_texture.png")
+                    cv2.imwrite(texture_path, (albedo * 255).astype(np.uint8)[..., ::-1])  # BGR转换为RGB保存
+                    material_info[color_name]["texture"] = os.path.basename(texture_path)
+                    
+                    # Write mesh with texture
+                    mesh.write(mesh_path)
+                    
+                    print(f"[INFO] Successfully extracted mesh for {color_name} with {n_points} points")
+                    
+                except Exception as e:
+                    print(f"[ERROR] Failed to extract mesh for label {color_name}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    
+                finally:
+                    # Restore original parameters
+                    self.renderer.gaussians._xyz = orig_xyz
+                    self.renderer.gaussians._features_dc = orig_features_dc
+                    self.renderer.gaussians._features_rest = orig_features_rest
+                    self.renderer.gaussians._scaling = orig_scaling
+                    self.renderer.gaussians._rotation = orig_rotation
+                    self.renderer.gaussians._opacity = orig_opacity
+            
+            # Save material info
+            material_info_path = os.path.join(self.opt.outdir, f"{self.opt.save_path}_materials.json")
+            with open(material_info_path, 'w') as f:
+                json.dump(material_info, f, indent=2)
+            print(f"[INFO] Material information saved to {material_info_path}")
+        else:
+            print("[WARNING] No labels found, skipping labeled mesh extraction")
 
 if __name__ == "__main__":
     import argparse
